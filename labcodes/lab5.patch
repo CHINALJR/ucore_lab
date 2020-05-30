@@ -1558,7 +1558,7 @@ diff -r -u -P ../../origin/labcodes/lab5/kern/debug/kdebug.c.orig lab5/kern/debu
 + * */
 +void
 +print_stackframe(void) {
-+     /* LAB1 YOUR CODE : STEP 1 */
++     /* LAB1 2019310834 : STEP 1 */
 +     /* (1) call read_ebp() to get the value of ebp. the type is (uint32_t);
 +      * (2) call read_eip() to get the value of eip. the type is (uint32_t);
 +      * (3) from 0 .. STACKFRAME_DEPTH
@@ -1702,14 +1702,14 @@ diff -r -u -P ../../origin/labcodes/lab5/kern/mm/swap_fifo.c lab5/kern/mm/swap_f
 +++ lab5/kern/mm/swap_fifo.c	2020-05-28 10:09:50.580406495 +0800
 @@ -51,6 +51,7 @@
      //record the page access situlation
-     /*LAB3 EXERCISE 2: YOUR CODE*/ 
+     /*LAB3 EXERCISE 2: 2019310834*/ 
      //(1)link the most recent arrival page at the back of the pra_list_head qeueue.
 +    list_add(head, entry);
      return 0;
  }
  /*
 @@ -67,6 +68,12 @@
-      /*LAB3 EXERCISE 2: YOUR CODE*/ 
+      /*LAB3 EXERCISE 2: 2019310834*/ 
       //(1)  unlink the  earliest arrival page in front of pra_list_head qeueue
       //(2)  assign the value of *ptr_page to the addr of this page
 +     list_entry_t *le = head->prev;
@@ -1835,7 +1835,7 @@ diff -r -u -P ../../origin/labcodes/lab5/kern/trap/trap.c lab5/kern/trap/trap.c
 --- ../../origin/labcodes/lab5/kern/trap/trap.c	2020-05-28 10:03:30.642532999 +0800
 +++ lab5/kern/trap/trap.c	2020-05-28 11:15:45.585041032 +0800
 @@ -56,6 +56,13 @@
-      /* LAB5 YOUR CODE */ 
+      /* LAB5 2019310834 */ 
       //you should update your lab1 code (just add ONE or TWO lines of code), let user app to use syscall to get the service of ucore
       //so you should setup the syscall interrupt gate in here
 +    extern uintptr_t __vectors[];
@@ -6882,7 +6882,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +c0102253:	55                   	push   %ebp
 +c0102254:	89 e5                	mov    %esp,%ebp
 +c0102256:	83 ec 10             	sub    $0x10,%esp
-+     /* LAB5 YOUR CODE */ 
++     /* LAB5 2019310834 */ 
 +     //you should update your lab1 code (just add ONE or TWO lines of code), let user app to use syscall to get the service of ucore
 +     //so you should setup the syscall interrupt gate in here
 +    extern uintptr_t __vectors[];
@@ -6938,7 +6938,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +c0102319:	8b 45 fc             	mov    -0x4(%ebp),%eax
 +c010231c:	66 89 14 c5 86 e7 19 	mov    %dx,-0x3fe6187a(,%eax,8)
 +c0102323:	c0 
-+     /* LAB5 YOUR CODE */ 
++     /* LAB5 2019310834 */ 
 +     //you should update your lab1 code (just add ONE or TWO lines of code), let user app to use syscall to get the service of ucore
 +     //so you should setup the syscall interrupt gate in here
 +    extern uintptr_t __vectors[];
@@ -7535,7 +7535,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +        break;
 +c01028f9:	e9 f6 00 00 00       	jmp    c01029f4 <trap_dispatch+0x227>
 +         */
-+        /* LAB5 YOUR CODE */
++        /* LAB5 2019310834 */
 +        /* you should upate you lab1 code (just add ONE or TWO lines of code):
 +         *    Every TICK_NUM cycle, you should set current process's current->need_resched = 1
 +         */
@@ -7589,7 +7589,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +c0102988:	e8 d2 d9 ff ff       	call   c010035f <cprintf>
 +        break;
 +c010298d:	eb 65                	jmp    c01029f4 <trap_dispatch+0x227>
-+    //LAB1 CHALLENGE 1 : YOUR CODE you should modify below codes.
++    //LAB1 CHALLENGE 1 : 2019310834 you should modify below codes.
 +    case T_SWITCH_TOU:
 +    case T_SWITCH_TOK:
 +        panic("T_SWITCH_** ??\n");
@@ -17571,7 +17571,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +c0107a68:	8b 55 d8             	mov    -0x28(%ebp),%edx
 +c0107a6b:	89 10                	mov    %edx,(%eax)
 +    //record the page access situlation
-+    /*LAB3 EXERCISE 2: YOUR CODE*/ 
++    /*LAB3 EXERCISE 2: 2019310834*/ 
 +    //(1)link the most recent arrival page at the back of the pra_list_head qeueue.
 +    list_add(head, entry);
 +    return 0;
@@ -17617,7 +17617,7 @@ diff -r -u -P ../../origin/labcodes/lab5/obj/kernel.asm lab5/obj/kernel.asm
 +c0107acb:	c7 04 24 c3 d7 10 c0 	movl   $0xc010d7c3,(%esp)
 +c0107ad2:	e8 0a 93 ff ff       	call   c0100de1 <__panic>
 +     /* Select the victim */
-+     /*LAB3 EXERCISE 2: YOUR CODE*/ 
++     /*LAB3 EXERCISE 2: 2019310834*/ 
 +     //(1)  unlink the  earliest arrival page in front of pra_list_head qeueue
 +     //(2)  assign the value of *ptr_page to the addr of this page
 +     list_entry_t *le = head->prev;

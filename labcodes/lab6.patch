@@ -362,7 +362,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/debug/kdebug.c.orig lab6/kern/debu
 + * */
 +void
 +print_stackframe(void) {
-+     /* LAB1 YOUR CODE : STEP 1 */
++     /* LAB1 2019310834 : STEP 1 */
 +     /* (1) call read_ebp() to get the value of ebp. the type is (uint32_t);
 +      * (2) call read_eip() to get the value of eip. the type is (uint32_t);
 +      * (3) from 0 .. STACKFRAME_DEPTH
@@ -506,14 +506,14 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/mm/swap_fifo.c lab6/kern/mm/swap_f
 +++ lab6/kern/mm/swap_fifo.c	2020-05-28 17:28:19.573041032 +0800
 @@ -51,6 +51,7 @@
      //record the page access situlation
-     /*LAB3 EXERCISE 2: YOUR CODE*/ 
+     /*LAB3 EXERCISE 2: 2019310834*/ 
      //(1)link the most recent arrival page at the back of the pra_list_head qeueue.
 +    list_add(head, entry);
      return 0;
  }
  /*
 @@ -67,6 +68,12 @@
-      /*LAB3 EXERCISE 2: YOUR CODE*/ 
+      /*LAB3 EXERCISE 2: 2019310834*/ 
       //(1)  unlink the  earliest arrival page in front of pra_list_head qeueue
       //(2)  assign the value of *ptr_page to the addr of this page
 +     list_entry_t *le = head->prev;
@@ -734,7 +734,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/proc
 +alloc_proc(void) {
 +    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
 +    if (proc != NULL) {
-+    //LAB4:EXERCISE1 YOUR CODE
++    //LAB4:EXERCISE1 2019310834
 +    /*
 +     * below fields in proc_struct need to be initialized
 +     *       enum proc_state state;                      // Process state
@@ -750,13 +750,13 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/proc
 +     *       uint32_t flags;                             // Process flag
 +     *       char name[PROC_NAME_LEN + 1];               // Process name
 +     */
-+     //LAB5 YOUR CODE : (update LAB4 steps)
++     //LAB5 2019310834 : (update LAB4 steps)
 +    /*
 +     * below fields(add in LAB5) in proc_struct need to be initialized	
 +     *       uint32_t wait_state;                        // waiting state
 +     *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
 +	 */
-+     //LAB6 YOUR CODE : (update LAB5 steps)
++     //LAB6 2019310834 : (update LAB5 steps)
 +    /*
 +     * below fields(add in LAB6) in proc_struct need to be initialized
 +     *     struct run_queue *rq;                       // running queue contains Process
@@ -1027,7 +1027,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/proc
 +        goto fork_out;
 +    }
 +    ret = -E_NO_MEM;
-+    //LAB4:EXERCISE2 YOUR CODE
++    //LAB4:EXERCISE2 2019310834
 +    /*
 +     * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
 +     * MACROs or Functions:
@@ -1053,7 +1053,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/proc
 +    //    6. call wakeup_proc to make the new child process RUNNABLE
 +    //    7. set ret vaule using child proc's pid
 +
-+	//LAB5 YOUR CODE : (update LAB4 steps)
++	//LAB5 2019310834 : (update LAB4 steps)
 +   /* Some Functions
 +    *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process 
 +    *    -------------------
@@ -1250,7 +1250,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/proc
 +    //(6) setup trapframe for user environment
 +    struct trapframe *tf = current->tf;
 +    memset(tf, 0, sizeof(struct trapframe));
-+    /* LAB5:EXERCISE1 YOUR CODE
++    /* LAB5:EXERCISE1 2019310834
 +     * should set tf_cs,tf_ds,tf_es,tf_ss,tf_esp,tf_eip,tf_eflags
 +     * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
 +     *          tf_cs should be USER_CS segment (see memlayout.h)
@@ -1559,7 +1559,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 +#define USE_SKEW_HEAP 1
 +
 +/* You should define the BigStride constant here*/
-+/* LAB6: YOUR CODE */
++/* LAB6: 2019310834 */
 +#define BIG_STRIDE    0x7FFFFFFF /* ??? */
 +
 +/* The compare function for two skew_heap_node_t's and the
@@ -1596,7 +1596,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 -    proc->rq = rq;
 -    rq->proc_num ++;
 +stride_init(struct run_queue *rq) {
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +     list_init(&(rq->run_list));
 +     rq->lab6_run_pool = NULL;
 +     rq->proc_num = 0;
@@ -1621,7 +1621,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 -    list_del_init(&(proc->run_link));
 -    rq->proc_num --;
 +stride_enqueue(struct run_queue *rq, struct proc_struct *proc) {
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     rq->lab6_run_pool =
 +          skew_heap_insert(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
@@ -1646,7 +1646,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 + */
 +static void
 +stride_dequeue(struct run_queue *rq, struct proc_struct *proc) {
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     rq->lab6_run_pool =
 +          skew_heap_remove(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
@@ -1677,7 +1677,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 -    }
 -    return NULL;
 +stride_pick_next(struct run_queue *rq) {
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     if (rq->lab6_run_pool == NULL) return NULL;
 +     struct proc_struct *p = le2proc(rq->lab6_run_pool, lab6_run_pool);
@@ -1720,7 +1720,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern
 -        proc->need_resched = 1;
 -    }
 +stride_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +     if (proc->time_slice > 0) {
 +          proc->time_slice --;
 +     }
@@ -1812,7 +1812,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
 @@ -8,7 +8,7 @@
  
  /* You should define the BigStride constant here*/
- /* LAB6: YOUR CODE */
+ /* LAB6: 2019310834 */
 -#define BIG_STRIDE    /* you should give a value, and is ??? */
 +#define BIG_STRIDE    0x7FFFFFFF /* ??? */
  
@@ -1827,12 +1827,12 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
   */
  static void
  stride_init(struct run_queue *rq) {
--     /* LAB6: YOUR CODE 
+-     /* LAB6: 2019310834 
 -      * (1) init the ready process list: rq->run_list
 -      * (2) init the run pool: rq->lab6_run_pool
 -      * (3) set number of process: rq->proc_num to 0       
 -      */
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +     list_init(&(rq->run_list));
 +     rq->lab6_run_pool = NULL;
 +     rq->proc_num = 0;
@@ -1849,7 +1849,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
   */
  static void
  stride_enqueue(struct run_queue *rq, struct proc_struct *proc) {
--     /* LAB6: YOUR CODE 
+-     /* LAB6: 2019310834 
 -      * (1) insert the proc into rq correctly
 -      * NOTICE: you can use skew_heap or list. Important functions
 -      *         skew_heap_insert: insert a entry into skew_heap
@@ -1858,7 +1858,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
 -      * (3) set proc->rq pointer to rq
 -      * (4) increase rq->proc_num
 -      */
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     rq->lab6_run_pool =
 +          skew_heap_insert(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
@@ -1884,13 +1884,13 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
   */
  static void
  stride_dequeue(struct run_queue *rq, struct proc_struct *proc) {
--     /* LAB6: YOUR CODE 
+-     /* LAB6: 2019310834 
 -      * (1) remove the proc from rq correctly
 -      * NOTICE: you can use skew_heap or list. Important functions
 -      *         skew_heap_remove: remove a entry from skew_heap
 -      *         list_del_init: remove a entry from the  list
 -      */
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     rq->lab6_run_pool =
 +          skew_heap_remove(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
@@ -1917,14 +1917,14 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
   */
  static struct proc_struct *
  stride_pick_next(struct run_queue *rq) {
--     /* LAB6: YOUR CODE 
+-     /* LAB6: 2019310834 
 -      * (1) get a  proc_struct pointer p  with the minimum value of stride
 -             (1.1) If using skew_heap, we can use le2proc get the p from rq->lab6_run_poll
 -             (1.2) If using list, we have to search list to find the p with minimum stride value
 -      * (2) update p;s stride value: p->lab6_stride
 -      * (3) return p
 -      */
-+     /* LAB6: YOUR CODE */
++     /* LAB6: 2019310834 */
 +#if USE_SKEW_HEAP
 +     if (rq->lab6_run_pool == NULL) return NULL;
 +     struct proc_struct *p = le2proc(rq->lab6_run_pool, lab6_run_pool);
@@ -1954,7 +1954,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c la
 @@ -121,6 +144,12 @@
  static void
  stride_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
-      /* LAB6: YOUR CODE */
+      /* LAB6: 2019310834 */
 +     if (proc->time_slice > 0) {
 +          proc->time_slice --;
 +     }
@@ -1973,7 +1973,7 @@ diff -r -u -P ../../origin/labcodes/lab6/kern/trap/trap.c lab6/kern/trap/trap.c
 --- ../../origin/labcodes/lab6/kern/trap/trap.c	2020-05-28 10:03:30.650537000 +0800
 +++ lab6/kern/trap/trap.c	2020-05-28 17:44:47.665041032 +0800
 @@ -57,6 +57,13 @@
-      /* LAB5 YOUR CODE */ 
+      /* LAB5 2019310834 */ 
       //you should update your lab1 code (just add ONE or TWO lines of code), let user app to use syscall to get the service of ucore
       //so you should setup the syscall interrupt gate in here
 +    extern uintptr_t __vectors[];

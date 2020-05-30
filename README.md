@@ -69,18 +69,18 @@ EXERCISE STEPS
   $git pull
 1 $cd labX  
 2 read code (specially the modified or added files)
-3 add your code
-4 compile your code
+3 add 2019310834
+4 compile 2019310834
   $make
-5 check your code
+5 check 2019310834
   $make qemu
 OR
   $make grade
 
-6 debug your code
+6 debug 2019310834
   $make debug
 
-7 handin your code
+7 handin 2019310834
   $make handin
 ```
 
