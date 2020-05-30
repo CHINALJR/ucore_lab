@@ -1,0 +1,1998 @@
+diff -r -u -P ../../origin/labcodes/lab6/kern/debug/kdebug.c lab6/kern/debug/kdebug.c
+--- ../../origin/labcodes/lab6/kern/debug/kdebug.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/debug/kdebug.c	2020-05-28 17:28:19.573041032 +0800
+@@ -347,5 +347,19 @@
+       *           NOTICE: the calling funciton's return addr eip  = ss:[ebp+4]
+       *                   the calling funciton's ebp = ss:[ebp]
+       */
++    uint32_t ebp = read_ebp(), eip = read_eip();
++
++    int i, j;
++    for (i = 0; i < STACKFRAME_DEPTH && ebp != 0; i ++) {
++        cprintf("ebp:0x%08x eip:0x%08x args:", ebp, eip);
++        uint32_t *args = (uint32_t *)ebp + 2;
++        for (j = 0; j < 4; j ++) {
++            cprintf("0x%08x ", args[j]);
++        }
++        cprintf("\n");
++        print_debuginfo(eip - 1);
++        eip = ((uint32_t *)ebp)[1];
++        ebp = ((uint32_t *)ebp)[0];
++    }
+ }
+ 
+diff -r -u -P ../../origin/labcodes/lab6/kern/debug/kdebug.c.orig lab6/kern/debug/kdebug.c.orig
+--- ../../origin/labcodes/lab6/kern/debug/kdebug.c.orig	1970-01-01 08:00:00.000000000 +0800
++++ lab6/kern/debug/kdebug.c.orig	2020-05-28 17:28:19.573041032 +0800
+@@ -0,0 +1,351 @@
++#include <defs.h>
++#include <x86.h>
++#include <stab.h>
++#include <stdio.h>
++#include <string.h>
++#include <memlayout.h>
++#include <sync.h>
++#include <vmm.h>
++#include <proc.h>
++#include <kdebug.h>
++#include <kmonitor.h>
++#include <assert.h>
++
++#define STACKFRAME_DEPTH 20
++
++extern const struct stab __STAB_BEGIN__[];  // beginning of stabs table
++extern const struct stab __STAB_END__[];    // end of stabs table
++extern const char __STABSTR_BEGIN__[];      // beginning of string table
++extern const char __STABSTR_END__[];        // end of string table
++
++/* debug information about a particular instruction pointer */
++struct eipdebuginfo {
++    const char *eip_file;                   // source code filename for eip
++    int eip_line;                           // source code line number for eip
++    const char *eip_fn_name;                // name of function containing eip
++    int eip_fn_namelen;                     // length of function's name
++    uintptr_t eip_fn_addr;                  // start address of function
++    int eip_fn_narg;                        // number of function arguments
++};
++
++/* user STABS data structure  */
++struct userstabdata {
++    const struct stab *stabs;
++    const struct stab *stab_end;
++    const char *stabstr;
++    const char *stabstr_end;
++};
++
++/* *
++ * stab_binsearch - according to the input, the initial value of
++ * range [*@region_left, *@region_right], find a single stab entry
++ * that includes the address @addr and matches the type @type,
++ * and then save its boundary to the locations that pointed
++ * by @region_left and @region_right.
++ *
++ * Some stab types are arranged in increasing order by instruction address.
++ * For example, N_FUN stabs (stab entries with n_type == N_FUN), which
++ * mark functions, and N_SO stabs, which mark source files.
++ *
++ * Given an instruction address, this function finds the single stab entry
++ * of type @type that contains that address.
++ *
++ * The search takes place within the range [*@region_left, *@region_right].
++ * Thus, to search an entire set of N stabs, you might do:
++ *
++ *      left = 0;
++ *      right = N - 1;    (rightmost stab)
++ *      stab_binsearch(stabs, &left, &right, type, addr);
++ *
++ * The search modifies *region_left and *region_right to bracket the @addr.
++ * *@region_left points to the matching stab that contains @addr,
++ * and *@region_right points just before the next stab.
++ * If *@region_left > *region_right, then @addr is not contained in any
++ * matching stab.
++ *
++ * For example, given these N_SO stabs:
++ *      Index  Type   Address
++ *      0      SO     f0100000
++ *      13     SO     f0100040
++ *      117    SO     f0100176
++ *      118    SO     f0100178
++ *      555    SO     f0100652
++ *      556    SO     f0100654
++ *      657    SO     f0100849
++ * this code:
++ *      left = 0, right = 657;
++ *      stab_binsearch(stabs, &left, &right, N_SO, 0xf0100184);
++ * will exit setting left = 118, right = 554.
++ * */
++static void
++stab_binsearch(const struct stab *stabs, int *region_left, int *region_right,
++           int type, uintptr_t addr) {
++    int l = *region_left, r = *region_right, any_matches = 0;
++
++    while (l <= r) {
++        int true_m = (l + r) / 2, m = true_m;
++
++        // search for earliest stab with right type
++        while (m >= l && stabs[m].n_type != type) {
++            m --;
++        }
++        if (m < l) {    // no match in [l, m]
++            l = true_m + 1;
++            continue;
++        }
++
++        // actual binary search
++        any_matches = 1;
++        if (stabs[m].n_value < addr) {
++            *region_left = m;
++            l = true_m + 1;
++        } else if (stabs[m].n_value > addr) {
++            *region_right = m - 1;
++            r = m - 1;
++        } else {
++            // exact match for 'addr', but continue loop to find
++            // *region_right
++            *region_left = m;
++            l = m;
++            addr ++;
++        }
++    }
++
++    if (!any_matches) {
++        *region_right = *region_left - 1;
++    }
++    else {
++        // find rightmost region containing 'addr'
++        l = *region_right;
++        for (; l > *region_left && stabs[l].n_type != type; l --)
++            /* do nothing */;
++        *region_left = l;
++    }
++}
++
++/* *
++ * debuginfo_eip - Fill in the @info structure with information about
++ * the specified instruction address, @addr.  Returns 0 if information
++ * was found, and negative if not.  But even if it returns negative it
++ * has stored some information into '*info'.
++ * */
++int
++debuginfo_eip(uintptr_t addr, struct eipdebuginfo *info) {
++    const struct stab *stabs, *stab_end;
++    const char *stabstr, *stabstr_end;
++
++    info->eip_file = "<unknown>";
++    info->eip_line = 0;
++    info->eip_fn_name = "<unknown>";
++    info->eip_fn_namelen = 9;
++    info->eip_fn_addr = addr;
++    info->eip_fn_narg = 0;
++
++    // find the relevant set of stabs
++    if (addr >= KERNBASE) {
++        stabs = __STAB_BEGIN__;
++        stab_end = __STAB_END__;
++        stabstr = __STABSTR_BEGIN__;
++        stabstr_end = __STABSTR_END__;
++    }
++    else {
++        // user-program linker script, tools/user.ld puts the information about the
++        // program's stabs (included __STAB_BEGIN__, __STAB_END__, __STABSTR_BEGIN__,
++        // and __STABSTR_END__) in a structure located at virtual address USTAB.
++        const struct userstabdata *usd = (struct userstabdata *)USTAB;
++
++        // make sure that debugger (current process) can access this memory
++        struct mm_struct *mm;
++        if (current == NULL || (mm = current->mm) == NULL) {
++            return -1;
++        }
++        if (!user_mem_check(mm, (uintptr_t)usd, sizeof(struct userstabdata), 0)) {
++            return -1;
++        }
++
++        stabs = usd->stabs;
++        stab_end = usd->stab_end;
++        stabstr = usd->stabstr;
++        stabstr_end = usd->stabstr_end;
++
++        // make sure the STABS and string table memory is valid
++        if (!user_mem_check(mm, (uintptr_t)stabs, (uintptr_t)stab_end - (uintptr_t)stabs, 0)) {
++            return -1;
++        }
++        if (!user_mem_check(mm, (uintptr_t)stabstr, stabstr_end - stabstr, 0)) {
++            return -1;
++        }
++    }
++
++    // String table validity checks
++    if (stabstr_end <= stabstr || stabstr_end[-1] != 0) {
++        return -1;
++    }
++
++    // Now we find the right stabs that define the function containing
++    // 'eip'.  First, we find the basic source file containing 'eip'.
++    // Then, we look in that source file for the function.  Then we look
++    // for the line number.
++
++    // Search the entire set of stabs for the source file (type N_SO).
++    int lfile = 0, rfile = (stab_end - stabs) - 1;
++    stab_binsearch(stabs, &lfile, &rfile, N_SO, addr);
++    if (lfile == 0)
++        return -1;
++
++    // Search within that file's stabs for the function definition
++    // (N_FUN).
++    int lfun = lfile, rfun = rfile;
++    int lline, rline;
++    stab_binsearch(stabs, &lfun, &rfun, N_FUN, addr);
++
++    if (lfun <= rfun) {
++        // stabs[lfun] points to the function name
++        // in the string table, but check bounds just in case.
++        if (stabs[lfun].n_strx < stabstr_end - stabstr) {
++            info->eip_fn_name = stabstr + stabs[lfun].n_strx;
++        }
++        info->eip_fn_addr = stabs[lfun].n_value;
++        addr -= info->eip_fn_addr;
++        // Search within the function definition for the line number.
++        lline = lfun;
++        rline = rfun;
++    } else {
++        // Couldn't find function stab!  Maybe we're in an assembly
++        // file.  Search the whole file for the line number.
++        info->eip_fn_addr = addr;
++        lline = lfile;
++        rline = rfile;
++    }
++    info->eip_fn_namelen = strfind(info->eip_fn_name, ':') - info->eip_fn_name;
++
++    // Search within [lline, rline] for the line number stab.
++    // If found, set info->eip_line to the right line number.
++    // If not found, return -1.
++    stab_binsearch(stabs, &lline, &rline, N_SLINE, addr);
++    if (lline <= rline) {
++        info->eip_line = stabs[rline].n_desc;
++    } else {
++        return -1;
++    }
++
++    // Search backwards from the line number for the relevant filename stab.
++    // We can't just use the "lfile" stab because inlined functions
++    // can interpolate code from a different file!
++    // Such included source files use the N_SOL stab type.
++    while (lline >= lfile
++           && stabs[lline].n_type != N_SOL
++           && (stabs[lline].n_type != N_SO || !stabs[lline].n_value)) {
++        lline --;
++    }
++    if (lline >= lfile && stabs[lline].n_strx < stabstr_end - stabstr) {
++        info->eip_file = stabstr + stabs[lline].n_strx;
++    }
++
++    // Set eip_fn_narg to the number of arguments taken by the function,
++    // or 0 if there was no containing function.
++    if (lfun < rfun) {
++        for (lline = lfun + 1;
++             lline < rfun && stabs[lline].n_type == N_PSYM;
++             lline ++) {
++            info->eip_fn_narg ++;
++        }
++    }
++    return 0;
++}
++
++/* *
++ * print_kerninfo - print the information about kernel, including the location
++ * of kernel entry, the start addresses of data and text segements, the start
++ * address of free memory and how many memory that kernel has used.
++ * */
++void
++print_kerninfo(void) {
++    extern char etext[], edata[], end[], kern_init[];
++    cprintf("Special kernel symbols:\n");
++    cprintf("  entry  0x%08x (phys)\n", kern_init);
++    cprintf("  etext  0x%08x (phys)\n", etext);
++    cprintf("  edata  0x%08x (phys)\n", edata);
++    cprintf("  end    0x%08x (phys)\n", end);
++    cprintf("Kernel executable memory footprint: %dKB\n", (end - kern_init + 1023)/1024);
++}
++
++/* *
++ * print_debuginfo - read and print the stat information for the address @eip,
++ * and info.eip_fn_addr should be the first address of the related function.
++ * */
++void
++print_debuginfo(uintptr_t eip) {
++    struct eipdebuginfo info;
++    if (debuginfo_eip(eip, &info) != 0) {
++        cprintf("    <unknow>: -- 0x%08x --\n", eip);
++    }
++    else {
++        char fnname[256];
++        int j;
++        for (j = 0; j < info.eip_fn_namelen; j ++) {
++            fnname[j] = info.eip_fn_name[j];
++        }
++        fnname[j] = '\0';
++        cprintf("    %s:%d: %s+%d\n", info.eip_file, info.eip_line,
++                fnname, eip - info.eip_fn_addr);
++    }
++}
++
++static __noinline uint32_t
++read_eip(void) {
++    uint32_t eip;
++    asm volatile("movl 4(%%ebp), %0" : "=r" (eip));
++    return eip;
++}
++
++/* *
++ * print_stackframe - print a list of the saved eip values from the nested 'call'
++ * instructions that led to the current point of execution
++ *
++ * The x86 stack pointer, namely esp, points to the lowest location on the stack
++ * that is currently in use. Everything below that location in stack is free. Pushing
++ * a value onto the stack will invole decreasing the stack pointer and then writing
++ * the value to the place that stack pointer pointes to. And popping a value do the
++ * opposite.
++ *
++ * The ebp (base pointer) register, in contrast, is associated with the stack
++ * primarily by software convention. On entry to a C function, the function's
++ * prologue code normally saves the previous function's base pointer by pushing
++ * it onto the stack, and then copies the current esp value into ebp for the duration
++ * of the function. If all the functions in a program obey this convention,
++ * then at any given point during the program's execution, it is possible to trace
++ * back through the stack by following the chain of saved ebp pointers and determining
++ * exactly what nested sequence of function calls caused this particular point in the
++ * program to be reached. This capability can be particularly useful, for example,
++ * when a particular function causes an assert failure or panic because bad arguments
++ * were passed to it, but you aren't sure who passed the bad arguments. A stack
++ * backtrace lets you find the offending function.
++ *
++ * The inline function read_ebp() can tell us the value of current ebp. And the
++ * non-inline function read_eip() is useful, it can read the value of current eip,
++ * since while calling this function, read_eip() can read the caller's eip from
++ * stack easily.
++ *
++ * In print_debuginfo(), the function debuginfo_eip() can get enough information about
++ * calling-chain. Finally print_stackframe() will trace and print them for debugging.
++ *
++ * Note that, the length of ebp-chain is limited. In boot/bootasm.S, before jumping
++ * to the kernel entry, the value of ebp has been set to zero, that's the boundary.
++ * */
++void
++print_stackframe(void) {
++     /* LAB1 YOUR CODE : STEP 1 */
++     /* (1) call read_ebp() to get the value of ebp. the type is (uint32_t);
++      * (2) call read_eip() to get the value of eip. the type is (uint32_t);
++      * (3) from 0 .. STACKFRAME_DEPTH
++      *    (3.1) printf value of ebp, eip
++      *    (3.2) (uint32_t)calling arguments [0..4] = the contents in address (uint32_t)ebp +2 [0..4]
++      *    (3.3) cprintf("\n");
++      *    (3.4) call print_debuginfo(eip-1) to print the C calling function name and line number, etc.
++      *    (3.5) popup a calling stackframe
++      *           NOTICE: the calling funciton's return addr eip  = ss:[ebp+4]
++      *                   the calling funciton's ebp = ss:[ebp]
++      */
++}
++
+diff -r -u -P ../../origin/labcodes/lab6/kern/mm/default_pmm.c lab6/kern/mm/default_pmm.c
+--- ../../origin/labcodes/lab6/kern/mm/default_pmm.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/mm/default_pmm.c	2020-05-28 17:28:19.573041032 +0800
+@@ -116,7 +116,7 @@
+     base->property = n;
+     SetPageProperty(base);
+     nr_free += n;
+-    list_add(&free_list, &(base->page_link));
++    list_add_before(&free_list, &(base->page_link));
+ }
+ 
+ static struct Page *
+@@ -127,6 +127,7 @@
+     }
+     struct Page *page = NULL;
+     list_entry_t *le = &free_list;
++    // TODO: optimize (next-fit)
+     while ((le = list_next(le)) != &free_list) {
+         struct Page *p = le2page(le, page_link);
+         if (p->property >= n) {
+@@ -135,12 +136,13 @@
+         }
+     }
+     if (page != NULL) {
+-        list_del(&(page->page_link));
+         if (page->property > n) {
+             struct Page *p = page + n;
+             p->property = page->property - n;
+-            list_add(&free_list, &(p->page_link));
+-    }
++            SetPageProperty(p);
++            list_add_after(&(page->page_link), &(p->page_link));
++        }
++        list_del(&(page->page_link));
+         nr_free -= n;
+         ClearPageProperty(page);
+     }
+@@ -162,6 +164,7 @@
+     while (le != &free_list) {
+         p = le2page(le, page_link);
+         le = list_next(le);
++        // TODO: optimize
+         if (base + base->property == p) {
+             base->property += p->property;
+             ClearPageProperty(p);
+@@ -175,7 +178,16 @@
+         }
+     }
+     nr_free += n;
+-    list_add(&free_list, &(base->page_link));
++    le = list_next(&free_list);
++    while (le != &free_list) {
++        p = le2page(le, page_link);
++        if (base + base->property <= p) {
++            assert(base + base->property != p);
++            break;
++        }
++        le = list_next(le);
++    }
++    list_add_before(le, &(base->page_link));
+ }
+ 
+ static size_t
+@@ -308,4 +320,3 @@
+     .nr_free_pages = default_nr_free_pages,
+     .check = default_check,
+ };
+-
+diff -r -u -P ../../origin/labcodes/lab6/kern/mm/pmm.c lab6/kern/mm/pmm.c
+--- ../../origin/labcodes/lab6/kern/mm/pmm.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/mm/pmm.c	2020-05-28 17:28:19.573041032 +0800
+@@ -375,6 +375,18 @@
+     }
+     return NULL;          // (8) return page table entry
+ #endif
++    pde_t *pdep = &pgdir[PDX(la)];
++    if (!(*pdep & PTE_P)) {
++        struct Page *page;
++        if (!create || (page = alloc_page()) == NULL) {
++            return NULL;
++        }
++        set_page_ref(page, 1);
++        uintptr_t pa = page2pa(page);
++        memset(KADDR(pa), 0, PGSIZE);
++        *pdep = pa | PTE_U | PTE_W | PTE_P;
++    }
++    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];
+ }
+ 
+ //get_page - get related Page struct for linear address la using PDT pgdir
+@@ -412,7 +424,7 @@
+      *   PTE_P           0x001                   // page table/directory entry flags bit : Present
+      */
+ #if 0
+-    if (0) {                      //(1) check if this page table entry is present
++    if (0) {                      //(1) check if page directory is present
+         struct Page *page = NULL; //(2) find corresponding page to pte
+                                   //(3) decrease page reference
+                                   //(4) and free this page when page reference reachs 0
+@@ -420,6 +432,14 @@
+                                   //(6) flush tlb
+     }
+ #endif
++    if (*ptep & PTE_P) {
++        struct Page *page = pte2page(*ptep);
++        if (page_ref_dec(page) == 0) {
++            free_page(page);
++        }
++        *ptep = 0;
++        tlb_invalidate(pgdir, la);
++    }
+ }
+ 
+ void
+@@ -501,6 +521,10 @@
+          * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
+          * (4) build the map of phy addr of  nage with the linear addr start
+          */
++        void * kva_src = page2kva(page);
++        void * kva_dst = page2kva(npage);
++        memcpy(kva_dst, kva_src, PGSIZE);
++        ret = page_insert(to, npage, start, perm);
+         assert(ret == 0);
+         }
+         start += PGSIZE;
+diff -r -u -P ../../origin/labcodes/lab6/kern/mm/swap_fifo.c lab6/kern/mm/swap_fifo.c
+--- ../../origin/labcodes/lab6/kern/mm/swap_fifo.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/mm/swap_fifo.c	2020-05-28 17:28:19.573041032 +0800
+@@ -51,6 +51,7 @@
+     //record the page access situlation
+     /*LAB3 EXERCISE 2: YOUR CODE*/ 
+     //(1)link the most recent arrival page at the back of the pra_list_head qeueue.
++    list_add(head, entry);
+     return 0;
+ }
+ /*
+@@ -67,6 +68,12 @@
+      /*LAB3 EXERCISE 2: YOUR CODE*/ 
+      //(1)  unlink the  earliest arrival page in front of pra_list_head qeueue
+      //(2)  assign the value of *ptr_page to the addr of this page
++     list_entry_t *le = head->prev;
++     assert(head!=le);
++     struct Page *p = le2page(le, pra_page_link);
++     list_del(le);
++     assert(p !=NULL);
++     *ptr_page = p;
+      return 0;
+ }
+ 
+diff -r -u -P ../../origin/labcodes/lab6/kern/mm/vmm.c lab6/kern/mm/vmm.c
+--- ../../origin/labcodes/lab6/kern/mm/vmm.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/mm/vmm.c	2020-05-28 17:28:19.573041032 +0800
+@@ -493,6 +493,36 @@
+         }
+    }
+ #endif
++    // try to find a pte, if pte's PT(Page Table) isn't existed, then create a PT.
++    // (notice the 3th parameter '1')
++    if ((ptep = get_pte(mm->pgdir, addr, 1)) == NULL) {
++        cprintf("get_pte in do_pgfault failed\n");
++        goto failed;
++    }
++    
++    if (*ptep == 0) { // if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
++        if (pgdir_alloc_page(mm->pgdir, addr, perm) == NULL) {
++            cprintf("pgdir_alloc_page in do_pgfault failed\n");
++            goto failed;
++        }
++    }
++    else { // if this pte is a swap entry, then load data from disk to a page with phy addr
++           // and call page_insert to map the phy addr with logical addr
++        if(swap_init_ok) {
++            struct Page *page=NULL;
++            if ((ret = swap_in(mm, addr, &page)) != 0) {
++                cprintf("swap_in in do_pgfault failed\n");
++                goto failed;
++            }    
++            page_insert(mm->pgdir, page, addr, perm);
++            swap_map_swappable(mm, addr, page, 1);
++            page->pra_vaddr = addr;
++        }
++        else {
++            cprintf("no swap_init_ok but ptep is %x, failed\n",*ptep);
++            goto failed;
++        }
++   }
+    ret = 0;
+ failed:
+     return ret;
+diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c lab6/kern/process/proc.c
+--- ../../origin/labcodes/lab6/kern/process/proc.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/process/proc.c	2020-05-28 17:46:36.505041032 +0800
+@@ -119,6 +119,26 @@
+      *     uint32_t lab6_stride;                       // FOR LAB6 ONLY: the current stride of the process
+      *     uint32_t lab6_priority;                     // FOR LAB6 ONLY: the priority of process, set by lab6_set_priority(uint32_t)
+      */
++    proc->state = PROC_UNINIT;
++    proc->pid = -1;
++    proc->runs = 0;
++    proc->kstack = 0;
++    proc->need_resched = 0;
++    proc->parent = NULL;
++    proc->mm = NULL;
++    memset(&(proc->context), 0, sizeof(struct context));
++    proc->tf = NULL;
++    proc->cr3 = boot_cr3;
++    proc->flags = 0;
++    memset(proc->name, 0, PROC_NAME_LEN);
++    proc->wait_state = 0;
++    proc->cptr = proc->optr = proc->yptr = NULL;
++    proc->rq = NULL;
++    list_init(&(proc->run_link));
++    proc->time_slice = 0;
++    proc->lab6_run_pool.left = proc->lab6_run_pool.right = proc->lab6_run_pool.parent = NULL;
++    proc->lab6_stride = 0;
++    proc->lab6_priority = 0;
+     }
+     return proc;
+ }
+@@ -413,7 +433,32 @@
+ 	*    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
+ 	*    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
+     */
+-	
++    if ((proc = alloc_proc()) == NULL) {
++        goto fork_out;
++    }
++
++    proc->parent = current;
++
++    if (setup_kstack(proc) != 0) {
++        goto bad_fork_cleanup_proc;
++    }
++    if (copy_mm(clone_flags, proc) != 0) {
++        goto bad_fork_cleanup_kstack;
++    }
++    copy_thread(proc, stack, tf);
++
++    bool intr_flag;
++    local_intr_save(intr_flag);
++    {
++        proc->pid = get_pid();
++        hash_proc(proc);
++        set_links(proc);
++    }
++    local_intr_restore(intr_flag);
++
++    wakeup_proc(proc);
++
++    ret = proc->pid;	
+ fork_out:
+     return ret;
+ 
+@@ -612,6 +657,11 @@
+      *          tf_eip should be the entry point of this binary program (elf->e_entry)
+      *          tf_eflags should be set to enable computer to produce Interrupt
+      */
++    tf->tf_cs = USER_CS;
++    tf->tf_ds = tf->tf_es = tf->tf_ss = USER_DS;
++    tf->tf_esp = USTACKTOP;
++    tf->tf_eip = elf->e_entry;
++    tf->tf_eflags = FL_IF;
+     ret = 0;
+ out:
+     return ret;
+diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.orig lab6/kern/process/proc.c.orig
+--- ../../origin/labcodes/lab6/kern/process/proc.c.orig	1970-01-01 08:00:00.000000000 +0800
++++ lab6/kern/process/proc.c.orig	2020-04-23 17:48:43.708433999 +0800
+@@ -0,0 +1,873 @@
++#include <proc.h>
++#include <kmalloc.h>
++#include <string.h>
++#include <sync.h>
++#include <pmm.h>
++#include <error.h>
++#include <sched.h>
++#include <elf.h>
++#include <vmm.h>
++#include <trap.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <assert.h>
++#include <unistd.h>
++
++/* ------------- process/thread mechanism design&implementation -------------
++(an simplified Linux process/thread mechanism )
++introduction:
++  ucore implements a simple process/thread mechanism. process contains the independent memory sapce, at least one threads
++for execution, the kernel data(for management), processor state (for context switch), files(in lab6), etc. ucore needs to
++manage all these details efficiently. In ucore, a thread is just a special kind of process(share process's memory).
++------------------------------
++process state       :     meaning               -- reason
++    PROC_UNINIT     :   uninitialized           -- alloc_proc
++    PROC_SLEEPING   :   sleeping                -- try_free_pages, do_wait, do_sleep
++    PROC_RUNNABLE   :   runnable(maybe running) -- proc_init, wakeup_proc, 
++    PROC_ZOMBIE     :   almost dead             -- do_exit
++
++-----------------------------
++process state changing:
++                                            
++  alloc_proc                                 RUNNING
++      +                                   +--<----<--+
++      +                                   + proc_run +
++      V                                   +-->---->--+ 
++PROC_UNINIT -- proc_init/wakeup_proc --> PROC_RUNNABLE -- try_free_pages/do_wait/do_sleep --> PROC_SLEEPING --
++                                           A      +                                                           +
++                                           |      +--- do_exit --> PROC_ZOMBIE                                +
++                                           +                                                                  + 
++                                           -----------------------wakeup_proc----------------------------------
++-----------------------------
++process relations
++parent:           proc->parent  (proc is children)
++children:         proc->cptr    (proc is parent)
++older sibling:    proc->optr    (proc is younger sibling)
++younger sibling:  proc->yptr    (proc is older sibling)
++-----------------------------
++related syscall for process:
++SYS_exit        : process exit,                           -->do_exit
++SYS_fork        : create child process, dup mm            -->do_fork-->wakeup_proc
++SYS_wait        : wait process                            -->do_wait
++SYS_exec        : after fork, process execute a program   -->load a program and refresh the mm
++SYS_clone       : create child thread                     -->do_fork-->wakeup_proc
++SYS_yield       : process flag itself need resecheduling, -- proc->need_sched=1, then scheduler will rescheule this process
++SYS_sleep       : process sleep                           -->do_sleep 
++SYS_kill        : kill process                            -->do_kill-->proc->flags |= PF_EXITING
++                                                                 -->wakeup_proc-->do_wait-->do_exit   
++SYS_getpid      : get the process's pid
++
++*/
++
++// the process set's list
++list_entry_t proc_list;
++
++#define HASH_SHIFT          10
++#define HASH_LIST_SIZE      (1 << HASH_SHIFT)
++#define pid_hashfn(x)       (hash32(x, HASH_SHIFT))
++
++// has list for process set based on pid
++static list_entry_t hash_list[HASH_LIST_SIZE];
++
++// idle proc
++struct proc_struct *idleproc = NULL;
++// init proc
++struct proc_struct *initproc = NULL;
++// current proc
++struct proc_struct *current = NULL;
++
++static int nr_process = 0;
++
++void kernel_thread_entry(void);
++void forkrets(struct trapframe *tf);
++void switch_to(struct context *from, struct context *to);
++
++// alloc_proc - alloc a proc_struct and init all fields of proc_struct
++static struct proc_struct *
++alloc_proc(void) {
++    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
++    if (proc != NULL) {
++    //LAB4:EXERCISE1 YOUR CODE
++    /*
++     * below fields in proc_struct need to be initialized
++     *       enum proc_state state;                      // Process state
++     *       int pid;                                    // Process ID
++     *       int runs;                                   // the running times of Proces
++     *       uintptr_t kstack;                           // Process kernel stack
++     *       volatile bool need_resched;                 // bool value: need to be rescheduled to release CPU?
++     *       struct proc_struct *parent;                 // the parent process
++     *       struct mm_struct *mm;                       // Process's memory management field
++     *       struct context context;                     // Switch here to run process
++     *       struct trapframe *tf;                       // Trap frame for current interrupt
++     *       uintptr_t cr3;                              // CR3 register: the base addr of Page Directroy Table(PDT)
++     *       uint32_t flags;                             // Process flag
++     *       char name[PROC_NAME_LEN + 1];               // Process name
++     */
++     //LAB5 YOUR CODE : (update LAB4 steps)
++    /*
++     * below fields(add in LAB5) in proc_struct need to be initialized	
++     *       uint32_t wait_state;                        // waiting state
++     *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
++	 */
++     //LAB6 YOUR CODE : (update LAB5 steps)
++    /*
++     * below fields(add in LAB6) in proc_struct need to be initialized
++     *     struct run_queue *rq;                       // running queue contains Process
++     *     list_entry_t run_link;                      // the entry linked in run queue
++     *     int time_slice;                             // time slice for occupying the CPU
++     *     skew_heap_entry_t lab6_run_pool;            // FOR LAB6 ONLY: the entry in the run pool
++     *     uint32_t lab6_stride;                       // FOR LAB6 ONLY: the current stride of the process
++     *     uint32_t lab6_priority;                     // FOR LAB6 ONLY: the priority of process, set by lab6_set_priority(uint32_t)
++     */
++    }
++    return proc;
++}
++
++// set_proc_name - set the name of proc
++char *
++set_proc_name(struct proc_struct *proc, const char *name) {
++    memset(proc->name, 0, sizeof(proc->name));
++    return memcpy(proc->name, name, PROC_NAME_LEN);
++}
++
++// get_proc_name - get the name of proc
++char *
++get_proc_name(struct proc_struct *proc) {
++    static char name[PROC_NAME_LEN + 1];
++    memset(name, 0, sizeof(name));
++    return memcpy(name, proc->name, PROC_NAME_LEN);
++}
++
++// set_links - set the relation links of process
++static void
++set_links(struct proc_struct *proc) {
++    list_add(&proc_list, &(proc->list_link));
++    proc->yptr = NULL;
++    if ((proc->optr = proc->parent->cptr) != NULL) {
++        proc->optr->yptr = proc;
++    }
++    proc->parent->cptr = proc;
++    nr_process ++;
++}
++
++// remove_links - clean the relation links of process
++static void
++remove_links(struct proc_struct *proc) {
++    list_del(&(proc->list_link));
++    if (proc->optr != NULL) {
++        proc->optr->yptr = proc->yptr;
++    }
++    if (proc->yptr != NULL) {
++        proc->yptr->optr = proc->optr;
++    }
++    else {
++       proc->parent->cptr = proc->optr;
++    }
++    nr_process --;
++}
++
++// get_pid - alloc a unique pid for process
++static int
++get_pid(void) {
++    static_assert(MAX_PID > MAX_PROCESS);
++    struct proc_struct *proc;
++    list_entry_t *list = &proc_list, *le;
++    static int next_safe = MAX_PID, last_pid = MAX_PID;
++    if (++ last_pid >= MAX_PID) {
++        last_pid = 1;
++        goto inside;
++    }
++    if (last_pid >= next_safe) {
++    inside:
++        next_safe = MAX_PID;
++    repeat:
++        le = list;
++        while ((le = list_next(le)) != list) {
++            proc = le2proc(le, list_link);
++            if (proc->pid == last_pid) {
++                if (++ last_pid >= next_safe) {
++                    if (last_pid >= MAX_PID) {
++                        last_pid = 1;
++                    }
++                    next_safe = MAX_PID;
++                    goto repeat;
++                }
++            }
++            else if (proc->pid > last_pid && next_safe > proc->pid) {
++                next_safe = proc->pid;
++            }
++        }
++    }
++    return last_pid;
++}
++
++// proc_run - make process "proc" running on cpu
++// NOTE: before call switch_to, should load  base addr of "proc"'s new PDT
++void
++proc_run(struct proc_struct *proc) {
++    if (proc != current) {
++        bool intr_flag;
++        struct proc_struct *prev = current, *next = proc;
++        local_intr_save(intr_flag);
++        {
++            current = proc;
++            load_esp0(next->kstack + KSTACKSIZE);
++            lcr3(next->cr3);
++            switch_to(&(prev->context), &(next->context));
++        }
++        local_intr_restore(intr_flag);
++    }
++}
++
++// forkret -- the first kernel entry point of a new thread/process
++// NOTE: the addr of forkret is setted in copy_thread function
++//       after switch_to, the current proc will execute here.
++static void
++forkret(void) {
++    forkrets(current->tf);
++}
++
++// hash_proc - add proc into proc hash_list
++static void
++hash_proc(struct proc_struct *proc) {
++    list_add(hash_list + pid_hashfn(proc->pid), &(proc->hash_link));
++}
++
++// unhash_proc - delete proc from proc hash_list
++static void
++unhash_proc(struct proc_struct *proc) {
++    list_del(&(proc->hash_link));
++}
++
++// find_proc - find proc frome proc hash_list according to pid
++struct proc_struct *
++find_proc(int pid) {
++    if (0 < pid && pid < MAX_PID) {
++        list_entry_t *list = hash_list + pid_hashfn(pid), *le = list;
++        while ((le = list_next(le)) != list) {
++            struct proc_struct *proc = le2proc(le, hash_link);
++            if (proc->pid == pid) {
++                return proc;
++            }
++        }
++    }
++    return NULL;
++}
++
++// kernel_thread - create a kernel thread using "fn" function
++// NOTE: the contents of temp trapframe tf will be copied to 
++//       proc->tf in do_fork-->copy_thread function
++int
++kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags) {
++    struct trapframe tf;
++    memset(&tf, 0, sizeof(struct trapframe));
++    tf.tf_cs = KERNEL_CS;
++    tf.tf_ds = tf.tf_es = tf.tf_ss = KERNEL_DS;
++    tf.tf_regs.reg_ebx = (uint32_t)fn;
++    tf.tf_regs.reg_edx = (uint32_t)arg;
++    tf.tf_eip = (uint32_t)kernel_thread_entry;
++    return do_fork(clone_flags | CLONE_VM, 0, &tf);
++}
++
++// setup_kstack - alloc pages with size KSTACKPAGE as process kernel stack
++static int
++setup_kstack(struct proc_struct *proc) {
++    struct Page *page = alloc_pages(KSTACKPAGE);
++    if (page != NULL) {
++        proc->kstack = (uintptr_t)page2kva(page);
++        return 0;
++    }
++    return -E_NO_MEM;
++}
++
++// put_kstack - free the memory space of process kernel stack
++static void
++put_kstack(struct proc_struct *proc) {
++    free_pages(kva2page((void *)(proc->kstack)), KSTACKPAGE);
++}
++
++// setup_pgdir - alloc one page as PDT
++static int
++setup_pgdir(struct mm_struct *mm) {
++    struct Page *page;
++    if ((page = alloc_page()) == NULL) {
++        return -E_NO_MEM;
++    }
++    pde_t *pgdir = page2kva(page);
++    memcpy(pgdir, boot_pgdir, PGSIZE);
++    pgdir[PDX(VPT)] = PADDR(pgdir) | PTE_P | PTE_W;
++    mm->pgdir = pgdir;
++    return 0;
++}
++
++// put_pgdir - free the memory space of PDT
++static void
++put_pgdir(struct mm_struct *mm) {
++    free_page(kva2page(mm->pgdir));
++}
++
++// copy_mm - process "proc" duplicate OR share process "current"'s mm according clone_flags
++//         - if clone_flags & CLONE_VM, then "share" ; else "duplicate"
++static int
++copy_mm(uint32_t clone_flags, struct proc_struct *proc) {
++    struct mm_struct *mm, *oldmm = current->mm;
++
++    /* current is a kernel thread */
++    if (oldmm == NULL) {
++        return 0;
++    }
++    if (clone_flags & CLONE_VM) {
++        mm = oldmm;
++        goto good_mm;
++    }
++
++    int ret = -E_NO_MEM;
++    if ((mm = mm_create()) == NULL) {
++        goto bad_mm;
++    }
++    if (setup_pgdir(mm) != 0) {
++        goto bad_pgdir_cleanup_mm;
++    }
++
++    lock_mm(oldmm);
++    {
++        ret = dup_mmap(mm, oldmm);
++    }
++    unlock_mm(oldmm);
++
++    if (ret != 0) {
++        goto bad_dup_cleanup_mmap;
++    }
++
++good_mm:
++    mm_count_inc(mm);
++    proc->mm = mm;
++    proc->cr3 = PADDR(mm->pgdir);
++    return 0;
++bad_dup_cleanup_mmap:
++    exit_mmap(mm);
++    put_pgdir(mm);
++bad_pgdir_cleanup_mm:
++    mm_destroy(mm);
++bad_mm:
++    return ret;
++}
++
++// copy_thread - setup the trapframe on the  process's kernel stack top and
++//             - setup the kernel entry point and stack of process
++static void
++copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf) {
++    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
++    *(proc->tf) = *tf;
++    proc->tf->tf_regs.reg_eax = 0;
++    proc->tf->tf_esp = esp;
++    proc->tf->tf_eflags |= FL_IF;
++
++    proc->context.eip = (uintptr_t)forkret;
++    proc->context.esp = (uintptr_t)(proc->tf);
++}
++
++/* do_fork -     parent process for a new child process
++ * @clone_flags: used to guide how to clone the child process
++ * @stack:       the parent's user stack pointer. if stack==0, It means to fork a kernel thread.
++ * @tf:          the trapframe info, which will be copied to child process's proc->tf
++ */
++int
++do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
++    int ret = -E_NO_FREE_PROC;
++    struct proc_struct *proc;
++    if (nr_process >= MAX_PROCESS) {
++        goto fork_out;
++    }
++    ret = -E_NO_MEM;
++    //LAB4:EXERCISE2 YOUR CODE
++    /*
++     * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
++     * MACROs or Functions:
++     *   alloc_proc:   create a proc struct and init fields (lab4:exercise1)
++     *   setup_kstack: alloc pages with size KSTACKPAGE as process kernel stack
++     *   copy_mm:      process "proc" duplicate OR share process "current"'s mm according clone_flags
++     *                 if clone_flags & CLONE_VM, then "share" ; else "duplicate"
++     *   copy_thread:  setup the trapframe on the  process's kernel stack top and
++     *                 setup the kernel entry point and stack of process
++     *   hash_proc:    add proc into proc hash_list
++     *   get_pid:      alloc a unique pid for process
++     *   wakeup_proc:  set proc->state = PROC_RUNNABLE
++     * VARIABLES:
++     *   proc_list:    the process set's list
++     *   nr_process:   the number of process set
++     */
++
++    //    1. call alloc_proc to allocate a proc_struct
++    //    2. call setup_kstack to allocate a kernel stack for child process
++    //    3. call copy_mm to dup OR share mm according clone_flag
++    //    4. call copy_thread to setup tf & context in proc_struct
++    //    5. insert proc_struct into hash_list && proc_list
++    //    6. call wakeup_proc to make the new child process RUNNABLE
++    //    7. set ret vaule using child proc's pid
++
++	//LAB5 YOUR CODE : (update LAB4 steps)
++   /* Some Functions
++    *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process 
++    *    -------------------
++	*    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
++	*    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
++    */
++	
++fork_out:
++    return ret;
++
++bad_fork_cleanup_kstack:
++    put_kstack(proc);
++bad_fork_cleanup_proc:
++    kfree(proc);
++    goto fork_out;
++}
++
++// do_exit - called by sys_exit
++//   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
++//   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
++//   3. call scheduler to switch to other process
++int
++do_exit(int error_code) {
++    if (current == idleproc) {
++        panic("idleproc exit.\n");
++    }
++    if (current == initproc) {
++        panic("initproc exit.\n");
++    }
++    
++    struct mm_struct *mm = current->mm;
++    if (mm != NULL) {
++        lcr3(boot_cr3);
++        if (mm_count_dec(mm) == 0) {
++            exit_mmap(mm);
++            put_pgdir(mm);
++            mm_destroy(mm);
++        }
++        current->mm = NULL;
++    }
++    current->state = PROC_ZOMBIE;
++    current->exit_code = error_code;
++    
++    bool intr_flag;
++    struct proc_struct *proc;
++    local_intr_save(intr_flag);
++    {
++        proc = current->parent;
++        if (proc->wait_state == WT_CHILD) {
++            wakeup_proc(proc);
++        }
++        while (current->cptr != NULL) {
++            proc = current->cptr;
++            current->cptr = proc->optr;
++    
++            proc->yptr = NULL;
++            if ((proc->optr = initproc->cptr) != NULL) {
++                initproc->cptr->yptr = proc;
++            }
++            proc->parent = initproc;
++            initproc->cptr = proc;
++            if (proc->state == PROC_ZOMBIE) {
++                if (initproc->wait_state == WT_CHILD) {
++                    wakeup_proc(initproc);
++                }
++            }
++        }
++    }
++    local_intr_restore(intr_flag);
++    
++    schedule();
++    panic("do_exit will not return!! %d.\n", current->pid);
++}
++
++/* load_icode - load the content of binary program(ELF format) as the new content of current process
++ * @binary:  the memory addr of the content of binary program
++ * @size:  the size of the content of binary program
++ */
++static int
++load_icode(unsigned char *binary, size_t size) {
++    if (current->mm != NULL) {
++        panic("load_icode: current->mm must be empty.\n");
++    }
++
++    int ret = -E_NO_MEM;
++    struct mm_struct *mm;
++    //(1) create a new mm for current process
++    if ((mm = mm_create()) == NULL) {
++        goto bad_mm;
++    }
++    //(2) create a new PDT, and mm->pgdir= kernel virtual addr of PDT
++    if (setup_pgdir(mm) != 0) {
++        goto bad_pgdir_cleanup_mm;
++    }
++    //(3) copy TEXT/DATA section, build BSS parts in binary to memory space of process
++    struct Page *page;
++    //(3.1) get the file header of the bianry program (ELF format)
++    struct elfhdr *elf = (struct elfhdr *)binary;
++    //(3.2) get the entry of the program section headers of the bianry program (ELF format)
++    struct proghdr *ph = (struct proghdr *)(binary + elf->e_phoff);
++    //(3.3) This program is valid?
++    if (elf->e_magic != ELF_MAGIC) {
++        ret = -E_INVAL_ELF;
++        goto bad_elf_cleanup_pgdir;
++    }
++
++    uint32_t vm_flags, perm;
++    struct proghdr *ph_end = ph + elf->e_phnum;
++    for (; ph < ph_end; ph ++) {
++    //(3.4) find every program section headers
++        if (ph->p_type != ELF_PT_LOAD) {
++            continue ;
++        }
++        if (ph->p_filesz > ph->p_memsz) {
++            ret = -E_INVAL_ELF;
++            goto bad_cleanup_mmap;
++        }
++        if (ph->p_filesz == 0) {
++            continue ;
++        }
++    //(3.5) call mm_map fun to setup the new vma ( ph->p_va, ph->p_memsz)
++        vm_flags = 0, perm = PTE_U;
++        if (ph->p_flags & ELF_PF_X) vm_flags |= VM_EXEC;
++        if (ph->p_flags & ELF_PF_W) vm_flags |= VM_WRITE;
++        if (ph->p_flags & ELF_PF_R) vm_flags |= VM_READ;
++        if (vm_flags & VM_WRITE) perm |= PTE_W;
++        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0) {
++            goto bad_cleanup_mmap;
++        }
++        unsigned char *from = binary + ph->p_offset;
++        size_t off, size;
++        uintptr_t start = ph->p_va, end, la = ROUNDDOWN(start, PGSIZE);
++
++        ret = -E_NO_MEM;
++
++     //(3.6) alloc memory, and  copy the contents of every program section (from, from+end) to process's memory (la, la+end)
++        end = ph->p_va + ph->p_filesz;
++     //(3.6.1) copy TEXT/DATA section of bianry program
++        while (start < end) {
++            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
++                goto bad_cleanup_mmap;
++            }
++            off = start - la, size = PGSIZE - off, la += PGSIZE;
++            if (end < la) {
++                size -= la - end;
++            }
++            memcpy(page2kva(page) + off, from, size);
++            start += size, from += size;
++        }
++
++      //(3.6.2) build BSS section of binary program
++        end = ph->p_va + ph->p_memsz;
++        if (start < la) {
++            /* ph->p_memsz == ph->p_filesz */
++            if (start == end) {
++                continue ;
++            }
++            off = start + PGSIZE - la, size = PGSIZE - off;
++            if (end < la) {
++                size -= la - end;
++            }
++            memset(page2kva(page) + off, 0, size);
++            start += size;
++            assert((end < la && start == end) || (end >= la && start == la));
++        }
++        while (start < end) {
++            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
++                goto bad_cleanup_mmap;
++            }
++            off = start - la, size = PGSIZE - off, la += PGSIZE;
++            if (end < la) {
++                size -= la - end;
++            }
++            memset(page2kva(page) + off, 0, size);
++            start += size;
++        }
++    }
++    //(4) build user stack memory
++    vm_flags = VM_READ | VM_WRITE | VM_STACK;
++    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE, vm_flags, NULL)) != 0) {
++        goto bad_cleanup_mmap;
++    }
++    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP-PGSIZE , PTE_USER) != NULL);
++    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP-2*PGSIZE , PTE_USER) != NULL);
++    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP-3*PGSIZE , PTE_USER) != NULL);
++    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP-4*PGSIZE , PTE_USER) != NULL);
++    
++    //(5) set current process's mm, sr3, and set CR3 reg = physical addr of Page Directory
++    mm_count_inc(mm);
++    current->mm = mm;
++    current->cr3 = PADDR(mm->pgdir);
++    lcr3(PADDR(mm->pgdir));
++
++    //(6) setup trapframe for user environment
++    struct trapframe *tf = current->tf;
++    memset(tf, 0, sizeof(struct trapframe));
++    /* LAB5:EXERCISE1 YOUR CODE
++     * should set tf_cs,tf_ds,tf_es,tf_ss,tf_esp,tf_eip,tf_eflags
++     * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
++     *          tf_cs should be USER_CS segment (see memlayout.h)
++     *          tf_ds=tf_es=tf_ss should be USER_DS segment
++     *          tf_esp should be the top addr of user stack (USTACKTOP)
++     *          tf_eip should be the entry point of this binary program (elf->e_entry)
++     *          tf_eflags should be set to enable computer to produce Interrupt
++     */
++    ret = 0;
++out:
++    return ret;
++bad_cleanup_mmap:
++    exit_mmap(mm);
++bad_elf_cleanup_pgdir:
++    put_pgdir(mm);
++bad_pgdir_cleanup_mm:
++    mm_destroy(mm);
++bad_mm:
++    goto out;
++}
++
++// do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
++//           - call load_icode to setup new memory space accroding binary prog.
++int
++do_execve(const char *name, size_t len, unsigned char *binary, size_t size) {
++    struct mm_struct *mm = current->mm;
++    if (!user_mem_check(mm, (uintptr_t)name, len, 0)) {
++        return -E_INVAL;
++    }
++    if (len > PROC_NAME_LEN) {
++        len = PROC_NAME_LEN;
++    }
++
++    char local_name[PROC_NAME_LEN + 1];
++    memset(local_name, 0, sizeof(local_name));
++    memcpy(local_name, name, len);
++
++    if (mm != NULL) {
++        lcr3(boot_cr3);
++        if (mm_count_dec(mm) == 0) {
++            exit_mmap(mm);
++            put_pgdir(mm);
++            mm_destroy(mm);
++        }
++        current->mm = NULL;
++    }
++    int ret;
++    if ((ret = load_icode(binary, size)) != 0) {
++        goto execve_exit;
++    }
++    set_proc_name(current, local_name);
++    return 0;
++
++execve_exit:
++    do_exit(ret);
++    panic("already exit: %e.\n", ret);
++}
++
++// do_yield - ask the scheduler to reschedule
++int
++do_yield(void) {
++    current->need_resched = 1;
++    return 0;
++}
++
++// do_wait - wait one OR any children with PROC_ZOMBIE state, and free memory space of kernel stack
++//         - proc struct of this child.
++// NOTE: only after do_wait function, all resources of the child proces are free.
++int
++do_wait(int pid, int *code_store) {
++    struct mm_struct *mm = current->mm;
++    if (code_store != NULL) {
++        if (!user_mem_check(mm, (uintptr_t)code_store, sizeof(int), 1)) {
++            return -E_INVAL;
++        }
++    }
++
++    struct proc_struct *proc;
++    bool intr_flag, haskid;
++repeat:
++    haskid = 0;
++    if (pid != 0) {
++        proc = find_proc(pid);
++        if (proc != NULL && proc->parent == current) {
++            haskid = 1;
++            if (proc->state == PROC_ZOMBIE) {
++                goto found;
++            }
++        }
++    }
++    else {
++        proc = current->cptr;
++        for (; proc != NULL; proc = proc->optr) {
++            haskid = 1;
++            if (proc->state == PROC_ZOMBIE) {
++                goto found;
++            }
++        }
++    }
++    if (haskid) {
++        current->state = PROC_SLEEPING;
++        current->wait_state = WT_CHILD;
++        schedule();
++        if (current->flags & PF_EXITING) {
++            do_exit(-E_KILLED);
++        }
++        goto repeat;
++    }
++    return -E_BAD_PROC;
++
++found:
++    if (proc == idleproc || proc == initproc) {
++        panic("wait idleproc or initproc.\n");
++    }
++    if (code_store != NULL) {
++        *code_store = proc->exit_code;
++    }
++    local_intr_save(intr_flag);
++    {
++        unhash_proc(proc);
++        remove_links(proc);
++    }
++    local_intr_restore(intr_flag);
++    put_kstack(proc);
++    kfree(proc);
++    return 0;
++}
++
++// do_kill - kill process with pid by set this process's flags with PF_EXITING
++int
++do_kill(int pid) {
++    struct proc_struct *proc;
++    if ((proc = find_proc(pid)) != NULL) {
++        if (!(proc->flags & PF_EXITING)) {
++            proc->flags |= PF_EXITING;
++            if (proc->wait_state & WT_INTERRUPTED) {
++                wakeup_proc(proc);
++            }
++            return 0;
++        }
++        return -E_KILLED;
++    }
++    return -E_INVAL;
++}
++
++// kernel_execve - do SYS_exec syscall to exec a user program called by user_main kernel_thread
++static int
++kernel_execve(const char *name, unsigned char *binary, size_t size) {
++    int ret, len = strlen(name);
++    asm volatile (
++        "int %1;"
++        : "=a" (ret)
++        : "i" (T_SYSCALL), "0" (SYS_exec), "d" (name), "c" (len), "b" (binary), "D" (size)
++        : "memory");
++    return ret;
++}
++
++#define __KERNEL_EXECVE(name, binary, size) ({                          \
++            cprintf("kernel_execve: pid = %d, name = \"%s\".\n",        \
++                    current->pid, name);                                \
++            kernel_execve(name, binary, (size_t)(size));                \
++        })
++
++#define KERNEL_EXECVE(x) ({                                             \
++            extern unsigned char _binary_obj___user_##x##_out_start[],  \
++                _binary_obj___user_##x##_out_size[];                    \
++            __KERNEL_EXECVE(#x, _binary_obj___user_##x##_out_start,     \
++                            _binary_obj___user_##x##_out_size);         \
++        })
++
++#define __KERNEL_EXECVE2(x, xstart, xsize) ({                           \
++            extern unsigned char xstart[], xsize[];                     \
++            __KERNEL_EXECVE(#x, xstart, (size_t)xsize);                 \
++        })
++
++#define KERNEL_EXECVE2(x, xstart, xsize)        __KERNEL_EXECVE2(x, xstart, xsize)
++
++// user_main - kernel thread used to exec a user program
++static int
++user_main(void *arg) {
++#ifdef TEST
++    KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE);
++#else
++    KERNEL_EXECVE(exit);
++#endif
++    panic("user_main execve failed.\n");
++}
++
++// init_main - the second kernel thread used to create user_main kernel threads
++static int
++init_main(void *arg) {
++    size_t nr_free_pages_store = nr_free_pages();
++    size_t kernel_allocated_store = kallocated();
++
++    int pid = kernel_thread(user_main, NULL, 0);
++    if (pid <= 0) {
++        panic("create user_main failed.\n");
++    }
++
++    while (do_wait(0, NULL) == 0) {
++        schedule();
++    }
++
++    cprintf("all user-mode processes have quit.\n");
++    assert(initproc->cptr == NULL && initproc->yptr == NULL && initproc->optr == NULL);
++    assert(nr_process == 2);
++    assert(list_next(&proc_list) == &(initproc->list_link));
++    assert(list_prev(&proc_list) == &(initproc->list_link));
++
++    cprintf("init check memory pass.\n");
++    return 0;
++}
++
++// proc_init - set up the first kernel thread idleproc "idle" by itself and 
++//           - create the second kernel thread init_main
++void
++proc_init(void) {
++    int i;
++
++    list_init(&proc_list);
++    for (i = 0; i < HASH_LIST_SIZE; i ++) {
++        list_init(hash_list + i);
++    }
++
++    if ((idleproc = alloc_proc()) == NULL) {
++        panic("cannot alloc idleproc.\n");
++    }
++
++    idleproc->pid = 0;
++    idleproc->state = PROC_RUNNABLE;
++    idleproc->kstack = (uintptr_t)bootstack;
++    idleproc->need_resched = 1;
++    set_proc_name(idleproc, "idle");
++    nr_process ++;
++
++    current = idleproc;
++
++    int pid = kernel_thread(init_main, NULL, 0);
++    if (pid <= 0) {
++        panic("create init_main failed.\n");
++    }
++
++    initproc = find_proc(pid);
++    set_proc_name(initproc, "init");
++
++    assert(idleproc != NULL && idleproc->pid == 0);
++    assert(initproc != NULL && initproc->pid == 1);
++}
++
++// cpu_idle - at the end of kern_init, the first kernel thread idleproc will do below works
++void
++cpu_idle(void) {
++    while (1) {
++        if (current->need_resched) {
++            schedule();
++        }
++    }
++}
++
++//FOR LAB6, set the process's priority (bigger value will get more CPU time) 
++void
++lab6_set_priority(uint32_t priority)
++{
++    if (priority == 0)
++        current->lab6_priority = 1;
++    else current->lab6_priority = priority;
++}
+diff -r -u -P ../../origin/labcodes/lab6/kern/process/proc.c.rej lab6/kern/process/proc.c.rej
+--- ../../origin/labcodes/lab6/kern/process/proc.c.rej	1970-01-01 08:00:00.000000000 +0800
++++ lab6/kern/process/proc.c.rej	2020-05-28 17:28:19.577041032 +0800
+@@ -0,0 +1,23 @@
++--- ../origin/labcodes/lab5/kern/process/proc.c	2020-05-28 10:03:30.642532999 +0800
+++++ kern/process/proc.c	2020-05-28 11:30:56.621041032 +0800
++@@ -109,6 +109,20 @@
++      *       uint32_t wait_state;                        // waiting state
++      *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
++ 	 */
+++        proc->state = PROC_UNINIT;
+++        proc->pid = -1;
+++        proc->runs = 0;
+++        proc->kstack = 0;
+++        proc->need_resched = 0;
+++        proc->parent = NULL;
+++        proc->mm = NULL;
+++        memset(&(proc->context), 0, sizeof(struct context));
+++        proc->tf = NULL;
+++        proc->cr3 = boot_cr3;
+++        proc->flags = 0;
+++        memset(proc->name, 0, PROC_NAME_LEN);
+++        proc->wait_state = 0;
+++        proc->cptr = proc->optr = proc->yptr = NULL;
++     }
++     return proc;
++ }
+diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched.c lab6/kern/schedule/default_sched.c
+--- ../../origin/labcodes/lab6/kern/schedule/default_sched.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/schedule/default_sched.c	2020-05-28 17:42:48.021041032 +0800
+@@ -4,55 +4,160 @@
+ #include <assert.h>
+ #include <default_sched.h>
+ 
+-static void
+-RR_init(struct run_queue *rq) {
+-    list_init(&(rq->run_list));
+-    rq->proc_num = 0;
++#define USE_SKEW_HEAP 1
++
++/* You should define the BigStride constant here*/
++/* LAB6: YOUR CODE */
++#define BIG_STRIDE    0x7FFFFFFF /* ??? */
++
++/* The compare function for two skew_heap_node_t's and the
++ * corresponding procs*/
++static int
++proc_stride_comp_f(void *a, void *b)
++{
++     struct proc_struct *p = le2proc(a, lab6_run_pool);
++     struct proc_struct *q = le2proc(b, lab6_run_pool);
++     int32_t c = p->lab6_stride - q->lab6_stride;
++     if (c > 0) return 1;
++     else if (c == 0) return 0;
++     else return -1;
+ }
+ 
++/*
++ * stride_init initializes the run-queue rq with correct assignment for
++ * member variables, including:
++ *
++ *   - run_list: should be a empty list after initialization.
++ *   - lab6_run_pool: NULL
++ *   - proc_num: 0
++ *   - max_time_slice: no need here, the variable would be assigned by the caller.
++ *
++ * hint: see proj13.1/libs/list.h for routines of the list structures.
++ */
+ static void
+-RR_enqueue(struct run_queue *rq, struct proc_struct *proc) {
+-    assert(list_empty(&(proc->run_link)));
+-    list_add_before(&(rq->run_list), &(proc->run_link));
+-    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
+-        proc->time_slice = rq->max_time_slice;
+-    }
+-    proc->rq = rq;
+-    rq->proc_num ++;
++stride_init(struct run_queue *rq) {
++     /* LAB6: YOUR CODE */
++     list_init(&(rq->run_list));
++     rq->lab6_run_pool = NULL;
++     rq->proc_num = 0;
+ }
+ 
++/*
++ * stride_enqueue inserts the process ``proc'' into the run-queue
++ * ``rq''. The procedure should verify/initialize the relevant members
++ * of ``proc'', and then put the ``lab6_run_pool'' node into the
++ * queue(since we use priority queue here). The procedure should also
++ * update the meta date in ``rq'' structure.
++ *
++ * proc->time_slice denotes the time slices allocation for the
++ * process, which should set to rq->max_time_slice.
++ * 
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
++ * queue structures.
++ */
+ static void
+-RR_dequeue(struct run_queue *rq, struct proc_struct *proc) {
+-    assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
+-    list_del_init(&(proc->run_link));
+-    rq->proc_num --;
++stride_enqueue(struct run_queue *rq, struct proc_struct *proc) {
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     rq->lab6_run_pool =
++          skew_heap_insert(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
++#else
++     assert(list_empty(&(proc->run_link)));
++     list_add_before(&(rq->run_list), &(proc->run_link));
++#endif
++     if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
++          proc->time_slice = rq->max_time_slice;
++     }
++     proc->rq = rq;
++     rq->proc_num ++;
+ }
+ 
++/*
++ * stride_dequeue removes the process ``proc'' from the run-queue
++ * ``rq'', the operation would be finished by the skew_heap_remove
++ * operations. Remember to update the ``rq'' structure.
++ *
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
++ * queue structures.
++ */
++static void
++stride_dequeue(struct run_queue *rq, struct proc_struct *proc) {
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     rq->lab6_run_pool =
++          skew_heap_remove(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
++#else
++     assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
++     list_del_init(&(proc->run_link));
++#endif
++     rq->proc_num --;
++}
++/*
++ * stride_pick_next pick the element from the ``run-queue'', with the
++ * minimum value of stride, and returns the corresponding process
++ * pointer. The process pointer would be calculated by macro le2proc,
++ * see proj13.1/kern/process/proc.h for definition. Return NULL if
++ * there is no process in the queue.
++ *
++ * When one proc structure is selected, remember to update the stride
++ * property of the proc. (stride += BIG_STRIDE / priority)
++ *
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
++ * queue structures.
++ */
+ static struct proc_struct *
+-RR_pick_next(struct run_queue *rq) {
+-    list_entry_t *le = list_next(&(rq->run_list));
+-    if (le != &(rq->run_list)) {
+-        return le2proc(le, run_link);
+-    }
+-    return NULL;
++stride_pick_next(struct run_queue *rq) {
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     if (rq->lab6_run_pool == NULL) return NULL;
++     struct proc_struct *p = le2proc(rq->lab6_run_pool, lab6_run_pool);
++#else
++     list_entry_t *le = list_next(&(rq->run_list));
++
++     if (le == &rq->run_list)
++          return NULL;
++     
++     struct proc_struct *p = le2proc(le, run_link);
++     le = list_next(le);
++     while (le != &rq->run_list)
++     {
++          struct proc_struct *q = le2proc(le, run_link);
++          if ((int32_t)(p->lab6_stride - q->lab6_stride) > 0)
++               p = q;
++          le = list_next(le);
++     }
++#endif
++     if (p->lab6_priority == 0)
++          p->lab6_stride += BIG_STRIDE;
++     else p->lab6_stride += BIG_STRIDE / p->lab6_priority;
++     return p;
+ }
+ 
++/*
++ * stride_proc_tick works with the tick event of current process. You
++ * should check whether the time slices for current process is
++ * exhausted and update the proc struct ``proc''. proc->time_slice
++ * denotes the time slices left for current
++ * process. proc->need_resched is the flag variable for process
++ * switching.
++ */
+ static void
+-RR_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
+-    if (proc->time_slice > 0) {
+-        proc->time_slice --;
+-    }
+-    if (proc->time_slice == 0) {
+-        proc->need_resched = 1;
+-    }
++stride_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
++     /* LAB6: YOUR CODE */
++     if (proc->time_slice > 0) {
++          proc->time_slice --;
++     }
++     if (proc->time_slice == 0) {
++          proc->need_resched = 1;
++     }
+ }
+ 
+ struct sched_class default_sched_class = {
+-    .name = "RR_scheduler",
+-    .init = RR_init,
+-    .enqueue = RR_enqueue,
+-    .dequeue = RR_dequeue,
+-    .pick_next = RR_pick_next,
+-    .proc_tick = RR_proc_tick,
++     .name = "stride_scheduler",
++     .init = stride_init,
++     .enqueue = stride_enqueue,
++     .dequeue = stride_dequeue,
++     .pick_next = stride_pick_next,
++     .proc_tick = stride_proc_tick,
+ };
+ 
+diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_copy lab6/kern/schedule/default_sched_copy
+--- ../../origin/labcodes/lab6/kern/schedule/default_sched_copy	1970-01-01 08:00:00.000000000 +0800
++++ lab6/kern/schedule/default_sched_copy	2020-05-28 17:42:11.084000000 +0800
+@@ -0,0 +1,58 @@
++#include <defs.h>
++#include <list.h>
++#include <proc.h>
++#include <assert.h>
++#include <default_sched.h>
++
++static void
++RR_init(struct run_queue *rq) {
++    list_init(&(rq->run_list));
++    rq->proc_num = 0;
++}
++
++static void
++RR_enqueue(struct run_queue *rq, struct proc_struct *proc) {
++    assert(list_empty(&(proc->run_link)));
++    list_add_before(&(rq->run_list), &(proc->run_link));
++    if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
++        proc->time_slice = rq->max_time_slice;
++    }
++    proc->rq = rq;
++    rq->proc_num ++;
++}
++
++static void
++RR_dequeue(struct run_queue *rq, struct proc_struct *proc) {
++    assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
++    list_del_init(&(proc->run_link));
++    rq->proc_num --;
++}
++
++static struct proc_struct *
++RR_pick_next(struct run_queue *rq) {
++    list_entry_t *le = list_next(&(rq->run_list));
++    if (le != &(rq->run_list)) {
++        return le2proc(le, run_link);
++    }
++    return NULL;
++}
++
++static void
++RR_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
++    if (proc->time_slice > 0) {
++        proc->time_slice --;
++    }
++    if (proc->time_slice == 0) {
++        proc->need_resched = 1;
++    }
++}
++
++struct sched_class default_sched_class = {
++    .name = "RR_scheduler",
++    .init = RR_init,
++    .enqueue = RR_enqueue,
++    .dequeue = RR_dequeue,
++    .pick_next = RR_pick_next,
++    .proc_tick = RR_proc_tick,
++};
++
+diff -r -u -P ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c lab6/kern/schedule/default_sched_stride_c
+--- ../../origin/labcodes/lab6/kern/schedule/default_sched_stride_c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/schedule/default_sched_stride_c	2020-05-28 19:51:07.803298032 +0800
+@@ -8,7 +8,7 @@
+ 
+ /* You should define the BigStride constant here*/
+ /* LAB6: YOUR CODE */
+-#define BIG_STRIDE    /* you should give a value, and is ??? */
++#define BIG_STRIDE    0x7FFFFFFF /* ??? */
+ 
+ /* The compare function for two skew_heap_node_t's and the
+  * corresponding procs*/
+@@ -32,15 +32,14 @@
+  *   - proc_num: 0
+  *   - max_time_slice: no need here, the variable would be assigned by the caller.
+  *
+- * hint: see libs/list.h for routines of the list structures.
++ * hint: see proj13.1/libs/list.h for routines of the list structures.
+  */
+ static void
+ stride_init(struct run_queue *rq) {
+-     /* LAB6: YOUR CODE 
+-      * (1) init the ready process list: rq->run_list
+-      * (2) init the run pool: rq->lab6_run_pool
+-      * (3) set number of process: rq->proc_num to 0       
+-      */
++     /* LAB6: YOUR CODE */
++     list_init(&(rq->run_list));
++     rq->lab6_run_pool = NULL;
++     rq->proc_num = 0;
+ }
+ 
+ /*
+@@ -53,20 +52,24 @@
+  * proc->time_slice denotes the time slices allocation for the
+  * process, which should set to rq->max_time_slice.
+  * 
+- * hint: see libs/skew_heap.h for routines of the priority
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
+  * queue structures.
+  */
+ static void
+ stride_enqueue(struct run_queue *rq, struct proc_struct *proc) {
+-     /* LAB6: YOUR CODE 
+-      * (1) insert the proc into rq correctly
+-      * NOTICE: you can use skew_heap or list. Important functions
+-      *         skew_heap_insert: insert a entry into skew_heap
+-      *         list_add_before: insert  a entry into the last of list   
+-      * (2) recalculate proc->time_slice
+-      * (3) set proc->rq pointer to rq
+-      * (4) increase rq->proc_num
+-      */
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     rq->lab6_run_pool =
++          skew_heap_insert(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
++#else
++     assert(list_empty(&(proc->run_link)));
++     list_add_before(&(rq->run_list), &(proc->run_link));
++#endif
++     if (proc->time_slice == 0 || proc->time_slice > rq->max_time_slice) {
++          proc->time_slice = rq->max_time_slice;
++     }
++     proc->rq = rq;
++     rq->proc_num ++;
+ }
+ 
+ /*
+@@ -74,40 +77,60 @@
+  * ``rq'', the operation would be finished by the skew_heap_remove
+  * operations. Remember to update the ``rq'' structure.
+  *
+- * hint: see libs/skew_heap.h for routines of the priority
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
+  * queue structures.
+  */
+ static void
+ stride_dequeue(struct run_queue *rq, struct proc_struct *proc) {
+-     /* LAB6: YOUR CODE 
+-      * (1) remove the proc from rq correctly
+-      * NOTICE: you can use skew_heap or list. Important functions
+-      *         skew_heap_remove: remove a entry from skew_heap
+-      *         list_del_init: remove a entry from the  list
+-      */
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     rq->lab6_run_pool =
++          skew_heap_remove(rq->lab6_run_pool, &(proc->lab6_run_pool), proc_stride_comp_f);
++#else
++     assert(!list_empty(&(proc->run_link)) && proc->rq == rq);
++     list_del_init(&(proc->run_link));
++#endif
++     rq->proc_num --;
+ }
+ /*
+  * stride_pick_next pick the element from the ``run-queue'', with the
+  * minimum value of stride, and returns the corresponding process
+  * pointer. The process pointer would be calculated by macro le2proc,
+- * see kern/process/proc.h for definition. Return NULL if
++ * see proj13.1/kern/process/proc.h for definition. Return NULL if
+  * there is no process in the queue.
+  *
+  * When one proc structure is selected, remember to update the stride
+  * property of the proc. (stride += BIG_STRIDE / priority)
+  *
+- * hint: see libs/skew_heap.h for routines of the priority
++ * hint: see proj13.1/libs/skew_heap.h for routines of the priority
+  * queue structures.
+  */
+ static struct proc_struct *
+ stride_pick_next(struct run_queue *rq) {
+-     /* LAB6: YOUR CODE 
+-      * (1) get a  proc_struct pointer p  with the minimum value of stride
+-             (1.1) If using skew_heap, we can use le2proc get the p from rq->lab6_run_poll
+-             (1.2) If using list, we have to search list to find the p with minimum stride value
+-      * (2) update p;s stride value: p->lab6_stride
+-      * (3) return p
+-      */
++     /* LAB6: YOUR CODE */
++#if USE_SKEW_HEAP
++     if (rq->lab6_run_pool == NULL) return NULL;
++     struct proc_struct *p = le2proc(rq->lab6_run_pool, lab6_run_pool);
++#else
++     list_entry_t *le = list_next(&(rq->run_list));
++
++     if (le == &rq->run_list)
++          return NULL;
++     
++     struct proc_struct *p = le2proc(le, run_link);
++     le = list_next(le);
++     while (le != &rq->run_list)
++     {
++          struct proc_struct *q = le2proc(le, run_link);
++          if ((int32_t)(p->lab6_stride - q->lab6_stride) > 0)
++               p = q;
++          le = list_next(le);
++     }
++#endif
++     if (p->lab6_priority == 0)
++          p->lab6_stride += BIG_STRIDE;
++     else p->lab6_stride += BIG_STRIDE / p->lab6_priority;
++     return p;
+ }
+ 
+ /*
+@@ -121,6 +144,12 @@
+ static void
+ stride_proc_tick(struct run_queue *rq, struct proc_struct *proc) {
+      /* LAB6: YOUR CODE */
++     if (proc->time_slice > 0) {
++          proc->time_slice --;
++     }
++     if (proc->time_slice == 0) {
++          proc->need_resched = 1;
++     }
+ }
+ 
+ struct sched_class default_sched_class = {
+@@ -131,3 +160,4 @@
+      .pick_next = stride_pick_next,
+      .proc_tick = stride_proc_tick,
+ };
++
+diff -r -u -P ../../origin/labcodes/lab6/kern/trap/trap.c lab6/kern/trap/trap.c
+--- ../../origin/labcodes/lab6/kern/trap/trap.c	2020-05-28 10:03:30.650537000 +0800
++++ lab6/kern/trap/trap.c	2020-05-28 17:44:47.665041032 +0800
+@@ -57,6 +57,13 @@
+      /* LAB5 YOUR CODE */ 
+      //you should update your lab1 code (just add ONE or TWO lines of code), let user app to use syscall to get the service of ucore
+      //so you should setup the syscall interrupt gate in here
++    extern uintptr_t __vectors[];
++    int i;
++    for (i = 0; i < sizeof(idt) / sizeof(struct gatedesc); i ++) {
++        SETGATE(idt[i], 0, GD_KTEXT, __vectors[i], DPL_KERNEL);
++    }
++    SETGATE(idt[T_SYSCALL], 1, GD_KTEXT, __vectors[T_SYSCALL], DPL_USER);
++    lidt(&idt_pd);
+ }
+ 
+ static const char *
+@@ -229,6 +236,9 @@
+          * IMPORTANT FUNCTIONS:
+ 	     * sched_class_proc_tick
+          */
++        ticks ++;
++        assert(current != NULL);
++        sched_class_proc_tick(current);
+         break;
+     case IRQ_OFFSET + IRQ_COM1:
+         c = cons_getc();

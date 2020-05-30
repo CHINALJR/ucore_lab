@@ -1,0 +1,23 @@
+--- ../origin/labcodes/lab5/kern/process/proc.c	2020-05-28 10:03:30.642532999 +0800
++++ kern/process/proc.c	2020-05-28 11:30:56.621041032 +0800
+@@ -109,6 +109,20 @@
+      *       uint32_t wait_state;                        // waiting state
+      *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
+ 	 */
++        proc->state = PROC_UNINIT;
++        proc->pid = -1;
++        proc->runs = 0;
++        proc->kstack = 0;
++        proc->need_resched = 0;
++        proc->parent = NULL;
++        proc->mm = NULL;
++        memset(&(proc->context), 0, sizeof(struct context));
++        proc->tf = NULL;
++        proc->cr3 = boot_cr3;
++        proc->flags = 0;
++        memset(proc->name, 0, PROC_NAME_LEN);
++        proc->wait_state = 0;
++        proc->cptr = proc->optr = proc->yptr = NULL;
+     }
+     return proc;
+ }
