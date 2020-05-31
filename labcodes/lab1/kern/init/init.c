@@ -13,6 +13,25 @@ int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
 static void lab1_switch_test(void);
 
+static void
+lab1_print_cur_status(void)
+{
+    static int round = 0;
+    uint16_t reg1, reg2, reg3, reg4;
+    asm volatile(
+        "mov %%cs, %0;"
+        "mov %%ds, %1;"
+        "mov %%es, %2;"
+        "mov %%ss, %3;"
+        : "=m"(reg1), "=m"(reg2), "=m"(reg3), "=m"(reg4));
+    cprintf("%d: @ring %d\n", round, reg1 & 3);
+    cprintf("%d:  cs = %x\n", round, reg1);
+    cprintf("%d:  ds = %x\n", round, reg2);
+    cprintf("%d:  es = %x\n", round, reg3);
+    cprintf("%d:  ss = %x\n", round, reg4);
+    round++;
+}
+
 int kern_init(void)
 {
     extern char edata[], end[];
@@ -40,7 +59,7 @@ int kern_init(void)
     lab1_switch_test();
 
     /* do nothing */
-    while (1)
+    while (1){    }
         ;
 }
 
@@ -67,24 +86,7 @@ void grade_backtrace(void)
     grade_backtrace0(0, (int)kern_init, 0xffff0000);
 }
 
-static void
-lab1_print_cur_status(void)
-{
-    static int round = 0;
-    uint16_t reg1, reg2, reg3, reg4;
-    asm volatile(
-        "mov %%cs, %0;"
-        "mov %%ds, %1;"
-        "mov %%es, %2;"
-        "mov %%ss, %3;"
-        : "=m"(reg1), "=m"(reg2), "=m"(reg3), "=m"(reg4));
-    cprintf("%d: @ring %d\n", round, reg1 & 3);
-    cprintf("%d:  cs = %x\n", round, reg1);
-    cprintf("%d:  ds = %x\n", round, reg2);
-    cprintf("%d:  es = %x\n", round, reg3);
-    cprintf("%d:  ss = %x\n", round, reg4);
-    round++;
-}
+
 
 static void
 lab1_switch_to_user(void)
@@ -104,7 +106,7 @@ lab1_switch_to_kernel(void)
     //LAB1 CHALLENGE 1 :  TODO
     asm volatile(
         "int %0\n\t" 
-        "popl %%esp" 
+        // "popl %%esp" 
         :
         : "i"(T_SWITCH_TOK));
 }

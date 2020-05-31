@@ -169,7 +169,53 @@ trap_dispatch(struct trapframe *tf) {
         break;
     case IRQ_OFFSET + IRQ_KBD:
         c = cons_getc();
-        cprintf("kbd [%03d] %c\n", c, c);
+        cprintf("kbd [%03d] %c =========%d\n", c, c,tf->tf_cs);
+        if (c == 0x33){ // switch to user mode
+            cprintf("2kbd [%03d] %c\n", c, c);
+            if (tf->tf_cs != USER_CS) {
+                cprintf("3kbd [%03d] %c %d\n", c, c,USER_CS);
+                switchk2u = *tf;
+                switchk2u.tf_cs = USER_CS;
+                switchk2u.tf_ds = switchk2u.tf_es = switchk2u.tf_ss = USER_DS;
+                switchk2u.tf_esp = (uint32_t)tf + sizeof(struct trapframe) - 8;
+            
+                // set eflags, make sure ucore can use io under user mode.
+                // if CPL > IOPL, then cpu will generate a general protection.
+                switchk2u.tf_eflags |= FL_IOPL_MASK;
+            
+                // set temporary stack
+                // then iret will jump to the right stack
+                *((uint32_t *)tf - 1) = (uint32_t)&switchk2u;
+            }
+        }
+        else if (c == 0x30){ // switch to kernel mode
+            cprintf("3kbd [%03d] %c\n", c, c);
+            if (tf->tf_cs != KERNEL_CS) {
+                cprintf("4kbd [%03d] %c %d\n", c, c,KERNEL_CS);
+                tf->tf_cs = KERNEL_CS;
+                tf->tf_ds = tf->tf_es = KERNEL_DS;
+                tf->tf_eflags &= ~FL_IOPL_MASK;
+                switchu2k = (struct trapframe *)(tf->tf_esp - (sizeof(struct trapframe) - 8));
+                memmove(switchu2k, tf, sizeof(struct trapframe) - 8);
+                *((uint32_t *)tf - 1) = (uint32_t)switchu2k;
+            }
+        }
+        else {//print ring == cs & 3
+            static int round2 = 0;
+            uint16_t reg1, reg2, reg3, reg4;
+            asm volatile(
+                "mov %%cs, %0;"
+                "mov %%ds, %1;"
+                "mov %%es, %2;"
+                "mov %%ss, %3;"
+                : "=m"(reg1), "=m"(reg2), "=m"(reg3), "=m"(reg4));
+            cprintf("%d: @ring %d\n", round2, reg1 & 3);
+            cprintf("%d:  cs = %x\n", round2, reg1);
+            cprintf("%d:  ds = %x\n", round2, reg2);
+            cprintf("%d:  es = %x\n", round2, reg3);
+            cprintf("%d:  ss = %x\n", round2, reg4);
+            round2++;
+        }
         break;
     //LAB1 CHALLENGE 1 : 2019310834 you should modify below codes.
     case T_SWITCH_TOU:
